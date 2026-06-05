@@ -1,4 +1,4 @@
-Here is the fully refined, professional version of your README.md. It has been restructured with high-level technical terminology, precise technical descriptions, and clean formatting suitable for enterprise-grade open-source repositories or professional portfolios.Markdown# Network Asset Discovery Utility
+
 
 An enterprise-ready, high-speed Python implementation designed for rapid network reconnaissance and asset discovery. Leveraging native network mapping engine sweeps, this utility programmatically enumerates active endpoints within a specified network block and aggregates the results into an optimized single-line telemetry output—ideal for decoupling discovery and passing targets cleanly into downstream vulnerability management pipelines.
 
