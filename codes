@@ -1,1 +1,176 @@
+#!/usr/bin/env python3
+"""Network Vulnerability Scan Framework
 
+A reusable Python framework for discovering hosts, enumerating services, and
+running Nmap vulnerability scripts. Generates a structured Markdown report
+that can be archived and compared across scans.
+
+Prerequisites (run once):
+- Install Nmap: brew install nmap (macOS) or apt-get install nmap
+- Install python-nmap: pip install python-nmap
+- Install rich (for pretty console output): pip install rich
+
+Usage::
+  python3 scan.py --network 192.168.1.0/24 --output report.md
+
+Options:
+  --network   CIDR range to scan (required)
+  --ports     Port range (default "1-1000")
+  --scripts   Nmap script categories (default "vuln,default")
+  --output    Markdown report file (default "scan_report.md")
+  --dry-run   Show the planned nmap command without executing
+
+The framework:
+  1. Discovers live hosts (ICMP ping sweep).
+  2. Performs a rapid SYN scan to enumerate open ports.
+  3. Runs selected Nmap NSE vulnerability scripts.
+  4. Parses results and builds a Markdown report with severity tags.
+  5. Stores the raw XML output for later deep-dive analysis.
+"""
+
+import argparse
+import subprocess
+import sys
+import os
+import xml.etree.ElementTree as ET
+from datetime import datetime
+from rich.console import Console
+from rich.table import Table
+
+console = Console()
+
+
+def run_nmap(cmd: list, dry_run: bool) -> subprocess.CompletedProcess:
+    """Execute an Nmap command, optionally in dry-run mode."""
+    console.print(f"[bold cyan]Executing:[/bold cyan] {' '.join(cmd)}")
+    if dry_run:
+        console.print("[yellow]Dry-run enabled - not executing command.[/yellow]")
+        return None
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=1800,
+        )
+        return result
+    except Exception as e:
+        console.print(f"[red]Error running Nmap: {e}[/red]")
+        sys.exit(1)
+
+
+def discover_hosts(network: str, dry_run: bool) -> list:
+    """Ping sweep using Nmap - returns list of live IPs."""
+    cmd = ["nmap", "-sn", "-n", network]
+    result = run_nmap(cmd, dry_run)
+    if dry_run:
+        return []
+    hosts = []
+    for line in result.stdout.splitlines():
+        if line.startswith("Nmap scan report for"):
+            hosts.append(line.split()[-1])
+    return hosts
+
+
+def scan_services(hosts: list, ports: str, scripts: str, xml_out: str, dry_run: bool):
+    """Run a full service+vuln scan on each host and store XML output."""
+    if not hosts:
+        console.print("[red]No live hosts found - aborting scan.[/red]")
+        return
+    target = " ".join(hosts)
+    cmd = [
+        "nmap",
+        "-sS",               # SYN stealth scan (requires root privileges)
+        f"-p{ports}",
+        "-T4",               # Aggressive timing (fast, still reliable)
+        f"--script={scripts}",
+        "-oX", xml_out,
+        target,
+    ]
+    run_nmap(cmd, dry_run)
+
+
+def parse_xml(xml_path: str) -> dict:
+    """Extract host, port, and script findings into a dict."""
+    tree = ET.parse(xml_path)
+    root = tree.getroot()
+    data = {}
+    for host in root.findall('host'):
+        addr = host.find('address').attrib.get('addr')
+        data[addr] = []
+        for port in host.findall('ports/port'):
+            portid = port.attrib.get('portid')
+            service = port.find('service').attrib.get('name')
+            for script in port.findall('script'):
+                output = script.attrib.get('output')
+                data[addr].append({
+                    'port': portid,
+                    'service': service,
+                    'output': output,
+                })
+    return data
+
+
+def severity_from_output(output: str) -> str:
+    """Very simple heuristic - looks for CVSS or common keywords."""
+    lowered = output.lower()
+    if "critical" in lowered or "cve-202" in lowered:
+        return "Critical"
+    if "high" in lowered:
+        return "High"
+    if "medium" in lowered:
+        return "Medium"
+    if "low" in lowered:
+        return "Low"
+    return "Info"
+
+
+def generate_report(data: dict, markdown_path: str, network: str):
+    now = datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')
+    with open(markdown_path, "w") as f:
+        f.write("# Network Vulnerability Report\n\n")
+        f.write(f"Network: {network}\n\n")
+        f.write(f"Generated: {now}\n\n")
+        for host, vulns in data.items():
+            f.write(f"## Host: {host}\n\n")
+            if not vulns:
+                f.write("No vulnerable services detected.\n\n")
+                continue
+            table_md = ("| Port | Service | Severity | Details |\n"
+                        "|------|---------|----------|---------|\n")
+            for v in vulns:
+                sev = severity_from_output(v['output'])
+                details = v['output'].replace("|", "\\|").replace("\n", " <br> ")
+                table_md += f"| {v['port']} | {v['service']} | {sev} | {details} |\n"
+            f.write(table_md + "\n")
+    console.print(f"[green]Report written to {markdown_path}[/green]")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Reusable network vuln scan framework")
+    parser.add_argument("--network", required=True,
+                        help="CIDR block to scan, e.g. 192.168.1.0/24")
+    parser.add_argument("--ports", default="1-1000",
+                        help="Port range for service scan")
+    parser.add_argument("--scripts", default="vuln,default",
+                        help="Nmap NSE script categories")
+    parser.add_argument("--output", default="scan_report.md",
+                        help="Markdown report file")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Show commands without executing")
+    args = parser.parse_args()
+
+    xml_out = "nmap_scan.xml"
+    live = discover_hosts(args.network, args.dry_run)
+    console.print(f"[bold]Live hosts:[/bold] {', '.join(live) or 'None'}")
+    if not args.dry_run:
+        scan_services(live, args.ports, args.scripts, xml_out, args.dry_run)
+        parsed = parse_xml(xml_out)
+        generate_report(parsed, args.output, args.network)
+    else:
+        console.print("[yellow]Dry-run complete - no XML or report generated.[/yellow]")
+
+
+if __name__ == "__main__":
+    main()
